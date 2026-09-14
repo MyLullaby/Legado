@@ -15,12 +15,11 @@ DEPENDENCIES:
   - SwiftSoup (= 2.11.3)
 
 SPEC REPOS:
-  https://mirrors.tuna.tsinghua.edu.cn/git/CocoaPods/Specs.git:
+  trunk:
     - Alamofire
+    - GCDWebServer
     - Kanna
     - SwCrypt
-  trunk:
-    - GCDWebServer
     - SwiftSoup
 
 SPEC CHECKSUMS:
@@ -30,6 +29,6 @@ SPEC CHECKSUMS:
   SwCrypt: 0d1f951b8a993d6e107f4776ee0d72c1adafd1df
   SwiftSoup: 959c9ac70d7053fbf476341bfac90ab228523f2a
 
-PODFILE CHECKSUM: f7b9e25de5d6d16980b07748a5d8dd9b740321e4
+PODFILE CHECKSUM: e54ee624fa15a56a67ee8ffbd0f27d0269b8184e
 
 COCOAPODS: 1.16.2

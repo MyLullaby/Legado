@@ -1,0 +1,91 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, codex/ios-ipa-actions]
+    paths:
+      - '.github/workflows/ios-ipa.yml'
+      - 'Legado/**'
+      - 'Legado.xcodeproj/**'
+      - 'Legado.xcworkspace/**'
+      - 'Podfile'
+      - 'Podfile.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install locked dependencies
+        run: |
+          xcodebuild -version
+          pod --version
+          pod install --deployment
+
+      - name: Archive for iPhone without signing
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild archive \
+            -workspace Legado.xcworkspace \
+            -scheme Legado \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Legado.xcarchive \
+            -resultBundlePath build/Archive.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            | tee build/xcodebuild.log
+
+      - name: Package and verify IPA
+        run: |
+          mkdir -p build/ipa/Payload
+          ditto build/Legado.xcarchive/Products/Applications/Legado.app build/ipa/Payload/Legado.app
+          app=build/ipa/Payload/Legado.app
+          plutil -lint "$app/Info.plist"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")
+          xcrun lipo -verify_arch arm64 "$app/$executable"
+          (cd build/ipa && zip -qry ../Legado-unsigned.ipa Payload)
+          unzip -tq build/Legado-unsigned.ipa
+          (cd build && shasum -a 256 Legado-unsigned.ipa > Legado-unsigned.ipa.sha256)
+          {
+            echo 'Unsigned IPA built successfully. Re-sign before installing on an iPhone.'
+            echo "Source commit: $GITHUB_SHA"
+            echo "Minimum iOS: $(/usr/libexec/PlistBuddy -c 'Print MinimumOSVersion' "$app/Info.plist")"
+            cat build/Legado-unsigned.ipa.sha256
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Legado-unsigned-ipa
+          path: |
+            build/Legado-unsigned.ipa
+            build/Legado-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: |
+            build/xcodebuild.log
+            build/Archive.xcresult
+          retention-days: 7
