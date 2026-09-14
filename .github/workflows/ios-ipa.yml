@@ -11,6 +11,7 @@ on:
       - 'Legado.xcworkspace/**'
       - 'Podfile'
       - 'Podfile.lock'
+      - 'ci/**'
 
 permissions:
   contents: read
@@ -36,6 +37,13 @@ jobs:
           xcodebuild -version
           pod _1.17.0_ --version
           pod _1.17.0_ install --deployment | tee build/pod-install.log
+
+      - name: Verify raw RSA compatibility
+        run: |
+          xcrun swiftc -swift-version 5 \
+            Pods/SwCrypt/SwCrypt/SwCrypt.swift ci/check-swcrypt-raw-rsa.swift \
+            -o build/check-swcrypt-raw-rsa
+          build/check-swcrypt-raw-rsa
 
       - name: Archive for iPhone without signing
         run: |
