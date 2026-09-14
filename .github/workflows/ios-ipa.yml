@@ -69,7 +69,7 @@ jobs:
           app=build/ipa/Payload/Legado.app
           plutil -lint "$app/Info.plist"
           executable=$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Info.plist")
-          xcrun lipo -verify_arch arm64 "$app/$executable"
+          xcrun lipo "$app/$executable" -verify_arch arm64
           (cd build/ipa && zip -qry ../Legado-unsigned.ipa Payload)
           unzip -tq build/Legado-unsigned.ipa
           (cd build && shasum -a 256 Legado-unsigned.ipa > Legado-unsigned.ipa.sha256)
