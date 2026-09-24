@@ -54,6 +54,15 @@ final class ReaderSessionCache {
         }
     }
 
+    func remove(bookID: String, sourceURL: String) {
+        remove(key: cacheKey(bookID: bookID, sourceURL: sourceURL))
+    }
+
+    func removeAll() {
+        sessions.removeAll()
+        recency.removeAll()
+    }
+
     private func cacheKey(bookID: String, sourceURL: String) -> String {
         "\(sourceURL)|\(bookID)"
     }
@@ -166,6 +175,7 @@ private struct ReaderShellView: View {
     @State private var route: ReaderRoute?
     @State private var context = ReaderRuntimeContext()
     @State private var progressSaveCoordinator = ReaderProgressSaveCoordinator()
+    @State private var showAddToBookshelfPrompt = false
 
     let session: ReaderSession
     let allSources: [BookSource]
@@ -208,13 +218,18 @@ private struct ReaderShellView: View {
                         onCacheEntireBook: {
                             guard viewModel.entireBookCacheState == .available else { return }
                             Task(priority: .utility) { @MainActor in
-                                await viewModel.downloadEntireBook()
-                                if viewModel.isEntireBookCached {
+                                if await viewModel.downloadEntireBook() {
                                     viewModel.showUserMessage("全书缓存完成")
                                 } else {
                                     viewModel.showUserMessage("部分章节缓存失败")
                                 }
                             }
+                        }
+                        , isChapterCached: { index in
+                            ChapterCacheStore.hasNonEmptyContent(
+                                bookKey: viewModel.chapterCacheIdentifier,
+                                index: index
+                            )
                         }
                     )
 
@@ -277,6 +292,17 @@ private struct ReaderShellView: View {
                 )
             }
         }
+        .alert("加入书架", isPresented: $showAddToBookshelfPrompt) {
+            Button("加入书架") {
+                addCurrentBookToBookshelf()
+                dismiss()
+            }
+            Button("暂不加入", role: .cancel) {
+                dismiss()
+            }
+        } message: {
+            Text("是否将“\(viewModel.bookName)”加入书架？加入后会持续保存阅读进度。")
+        }
         .overlay(alignment: .bottom) {
             if ttsManager.isControlVisible {
                 TTSControlBarView(
@@ -322,25 +348,7 @@ private struct ReaderShellView: View {
         }
         // Every navigation source prepares and validates the active chapter before creating
         // ReaderView. The service is still idempotent for restored sessions and retries.
-        if viewModel.currentContent == nil {
-            await viewModel.loadCurrentChapter()
-        }
-
-        // Warm a small bounded window before the user reaches the first chapter boundary. The
-        // native scroll controller still owns section insertion and pagination; this only makes
-        // its content provider hit the in-memory cache instead of starting disk/network work at
-        // the boundary.
-        let firstAdjacentIndex = viewModel.currentIndex + 1
-        let lastAdjacentIndex = min(firstAdjacentIndex + 1, viewModel.chapters.count - 1)
-        if firstAdjacentIndex <= lastAdjacentIndex {
-            Task(priority: .userInitiated) { @MainActor [weak viewModel] in
-                guard let viewModel else { return }
-                for index in firstAdjacentIndex...lastAdjacentIndex {
-                    guard !Task.isCancelled else { return }
-                    await viewModel.loadChapter(at: index)
-                }
-            }
-        }
+        await viewModel.loadCurrentChapter()
 
         ReaderSessionCache.shared.store(session)
         context = ReaderRuntimeContext(
@@ -406,7 +414,24 @@ private struct ReaderShellView: View {
         } else {
             flushReadingPosition()
         }
-        dismiss()
+        guard let bookshelfViewModel,
+              !bookshelfViewModel.isInShelf(bookUrl: viewModel.currentBookURL) else {
+            dismiss()
+            return
+        }
+        showAddToBookshelfPrompt = true
+    }
+
+    private func addCurrentBookToBookshelf() {
+        guard let bookshelfViewModel else { return }
+        let detail = BookDetail(
+            bookUrl: viewModel.currentBookURL,
+            name: viewModel.bookName,
+            author: viewModel.bookAuthor,
+            lastChapter: viewModel.currentChapter?.title,
+            origin: viewModel.source.bookSourceUrl
+        )
+        bookshelfViewModel.addBook(detail: detail, sourceUrl: viewModel.source.bookSourceUrl)
     }
 
     private func handleToolRouteRequested(_ toolRoute: ReaderToolRoute) {
@@ -491,6 +516,12 @@ private struct ReaderShellView: View {
             ReaderChapterListView(
                 chapters: viewModel.chapters,
                 currentIndex: paginator.chapterIndex,
+                isChapterCached: { chapter in
+                    ChapterCacheStore.hasNonEmptyContent(
+                        bookKey: viewModel.chapterCacheIdentifier,
+                        index: chapter.index
+                    )
+                },
                 onSelectChapter: { index in
                     self.route = nil
                     Task { @MainActor in
@@ -512,6 +543,9 @@ private struct ReaderShellView: View {
                     currentChapterCount: viewModel.chapters.count
                 ),
                 onConfirm: { selection in
+                    // Android saves the active reader state before source migration. Flush the
+                    // paginator's real page/offset, not only the current chapter index.
+                    flushReadingPosition()
                     self.route = nil
                     viewModel.changeSource(selection)
                 }

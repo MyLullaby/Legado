@@ -12,6 +12,7 @@ struct DZMNativeReaderView: UIViewControllerRepresentable {
     let onChapterRequested: (Int) -> Void
     let onReadingPositionChanged: (ReaderPosition, Bool) -> Void
     let onCacheEntireBook: () -> Void
+    let isChapterCached: (Int) -> Bool
 
     func makeUIViewController(context: Context) -> DZMNativeReaderHostController {
         let controller = DZMNativeReaderHostController()
@@ -22,7 +23,9 @@ struct DZMNativeReaderView: UIViewControllerRepresentable {
             onChapterRequested: onChapterRequested,
             onReadingPositionChanged: onReadingPositionChanged,
             onCacheEntireBook: onCacheEntireBook,
-            cacheState: readerViewModel.entireBookCacheState
+            cacheState: readerViewModel.entireBookCacheState,
+            cacheProgress: readerViewModel.isDownloading ? readerViewModel.downloadProgress : nil
+            , isChapterCached: isChapterCached
         )
         return controller
     }
@@ -35,7 +38,9 @@ struct DZMNativeReaderView: UIViewControllerRepresentable {
             onChapterRequested: onChapterRequested,
             onReadingPositionChanged: onReadingPositionChanged,
             onCacheEntireBook: onCacheEntireBook,
-            cacheState: readerViewModel.entireBookCacheState
+            cacheState: readerViewModel.entireBookCacheState,
+            cacheProgress: readerViewModel.isDownloading ? readerViewModel.downloadProgress : nil
+            , isChapterCached: isChapterCached
         )
     }
 
@@ -87,9 +92,20 @@ struct DZMNativeReaderSnapshot: Equatable {
 }
 
 enum DZMReaderChapterTitleResolver {
+    /// 解析菜单栏要显示的章节名。
+    ///
+    /// 以原生记录里的**当前章节名**为准：连续滚动模式可以跨章滚动，而进入阅读器时写入的
+    /// `snapshotTitle` 会一直停留在当时那一章，优先用它会让标题卡在旧章节上
+    /// （看到第五章、标题还是第二章）。
+    /// 只有当记录缺失、为空、或仍是占位名 `(无章节名)` 时才回退到快照
+    /// —— 这也覆盖了「旧归档记录名称为空」的情况。
     static func resolve(snapshotTitle: String, recordChapterTitle: String?) -> String {
-        let currentTitle = recordChapterTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return currentTitle.isEmpty ? snapshotTitle : currentTitle
+        let recordTitle = recordChapterTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !recordTitle.isEmpty, recordTitle != "(无章节名)" {
+            return recordTitle
+        }
+        let snapshot = snapshotTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return snapshot.isEmpty ? "阅读中" : snapshot
     }
 }
 
@@ -109,6 +125,8 @@ final class DZMNativeReaderHostController: UIViewController {
     private var previousInteractivePopGestureState: Bool?
     private var onCacheEntireBook: () -> Void = {}
     private var cacheState: ReaderBookCacheState = .available
+    private var cacheProgress: Double?
+    private var isChapterCached: (Int) -> Bool = { _ in false }
     private var chapterContentProvider: (Int, @escaping (String?) -> Void) -> Void = { _, completion in
         completion(nil)
     }
@@ -181,14 +199,19 @@ final class DZMNativeReaderHostController: UIViewController {
         onChapterRequested: @escaping (Int) -> Void,
         onReadingPositionChanged: @escaping (ReaderPosition, Bool) -> Void,
         onCacheEntireBook: @escaping () -> Void,
-        cacheState: ReaderBookCacheState
+        cacheState: ReaderBookCacheState,
+        cacheProgress: Double?,
+        isChapterCached: @escaping (Int) -> Bool
     ) {
         self.onBackRequested = onBackRequested
         self.onChapterRequested = onChapterRequested
         self.onReadingPositionChanged = onReadingPositionChanged
         self.onCacheEntireBook = onCacheEntireBook
         self.cacheState = cacheState
+        self.cacheProgress = cacheProgress
+        self.isChapterCached = isChapterCached
         self.chapterContentProvider = chapterContentProvider
+        readerController?.isChapterCached = isChapterCached
 
         guard let snapshot else { return }
         guard displayedIdentity != snapshot.identity else {
@@ -198,7 +221,9 @@ final class DZMNativeReaderHostController: UIViewController {
                 onReadingPositionChanged: onReadingPositionChanged,
                 onCacheEntireBook: onCacheEntireBook,
                 chapterTitle: snapshot.chapterTitle,
-                cacheState: cacheState
+                cacheState: cacheState,
+                cacheProgress: cacheProgress,
+                isChapterCached: isChapterCached
             )
             return
         }
@@ -270,13 +295,16 @@ final class DZMNativeReaderHostController: UIViewController {
             from: snapshot,
             chapterContentProvider: chapterContentProvider
         )
+        controller.isChapterCached = isChapterCached
         controller.updateCallbacks(
             onBackRequested: onBackRequested,
             onChapterRequested: onChapterRequested,
             onReadingPositionChanged: onReadingPositionChanged,
             onCacheEntireBook: onCacheEntireBook,
             chapterTitle: snapshot.chapterTitle,
-            cacheState: cacheState
+            cacheState: cacheState,
+            cacheProgress: cacheProgress,
+            isChapterCached: isChapterCached
         )
 
         addChild(controller)
@@ -297,14 +325,16 @@ private final class DZMEmbeddedReadController: DZMReadController {
     private var onCacheEntireBook: () -> Void = {}
     private var chapterTitle: String = ""
     private var cacheState: ReaderBookCacheState = .available
-
+    private var cacheProgress: Double?
     func updateCallbacks(
         onBackRequested: @escaping (ReaderPosition?) -> Void,
         onChapterRequested: @escaping (Int) -> Void,
         onReadingPositionChanged: @escaping (ReaderPosition, Bool) -> Void,
         onCacheEntireBook: @escaping () -> Void,
         chapterTitle: String,
-        cacheState: ReaderBookCacheState
+        cacheState: ReaderBookCacheState,
+        cacheProgress: Double?,
+        isChapterCached: @escaping (Int) -> Bool
     ) {
         self.onBackRequested = onBackRequested
         self.onChapterRequested = onChapterRequested
@@ -312,6 +342,9 @@ private final class DZMEmbeddedReadController: DZMReadController {
         self.onCacheEntireBook = onCacheEntireBook
         self.chapterTitle = chapterTitle
         self.cacheState = cacheState
+        self.cacheProgress = cacheProgress
+        self.isChapterCached = isChapterCached
+        readMenu?.topView.updateCacheProgress(cacheProgress)
         updateMenuChrome()
     }
 
@@ -324,6 +357,7 @@ private final class DZMEmbeddedReadController: DZMReadController {
         guard isViewLoaded else { return }
         updateMenuChapterTitle()
         readMenu?.topView.updateCacheEntireBook(state: cacheState)
+        readMenu?.topView.updateCacheProgress(cacheProgress)
     }
 
     private func updateMenuChapterTitle() {
@@ -353,6 +387,41 @@ private final class DZMEmbeddedReadController: DZMReadController {
 
     override func readMenuClickNextChapter(readMenu: DZMReadMenu!) {
         requestChapter(relativeOffset: 1)
+    }
+
+    // MARK: 字体 / 排版变更
+
+    /// 滚动模式下必须显式重排，否则改字号 / 字体 / 间距不会立即生效。
+    ///
+    /// 上游 `DZMReadController` 的这三个回调依赖
+    /// `GetCurrentReadViewController(isUpdateFont: true)` 去触发 `updateFont()`，
+    /// 但该方法在 `effectType == .scroll` 时直接返回 nil
+    /// （见 `DZMReadController+Operation.swift`）。本阅读器强制使用滚动模式，
+    /// 于是回调只重建了滚动控制器，而重建时读到的仍是旧的 `pageModels`，
+    /// 表现为「改完不生效，退出重进才生效」。
+    override func readMenuClickFont(readMenu: DZMReadMenu) {
+        applyTypographyChange()
+    }
+
+    override func readMenuClickFontSize(readMenu: DZMReadMenu) {
+        applyTypographyChange()
+    }
+
+    override func readMenuClickSpacing(readMenu: DZMReadMenu) {
+        applyTypographyChange()
+    }
+
+    /// 重排当前章节并重建滚动控制器。
+    ///
+    /// 先把可见页写回 `recordModel`，这样 `updateFont()` 读到的
+    /// `DZM_READ_RECORD_CURRENT_CHAPTER_LOCATION` 是最新的，重排后仍停在原位置。
+    private func applyTypographyChange() {
+        scrollController?.updateReadRecordForLifecycle()
+        // 先同步分页签名，让 `updateFont()` 内部的 `save()` 一次写对，
+        // 否则磁盘归档会带着旧签名，下次 `makeChapter` 判定缓存不可用而白重排一次。
+        readModel.recordModel.chapterModel?.paginationSignature = DZMNativeReadModelFactory.paginationSignature()
+        readModel.recordModel.updateFont()
+        creatPageController(displayController: GetCurrentReadViewController())
     }
 
     override func catalogViewClickChapter(
@@ -657,7 +726,7 @@ enum DZMNativeReadModelFactory {
         return actual.map { Int($0.intValue) == expected } ?? false
     }
 
-    private static func paginationSignature() -> String {
+    static func paginationSignature() -> String {
         let bounds = DZM_READ_VIEW_RECT ?? .zero
         let configuration = DZMReadConfigure.shared()
         return [

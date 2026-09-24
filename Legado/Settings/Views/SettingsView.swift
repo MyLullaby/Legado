@@ -8,10 +8,25 @@ struct SettingsView: View {
     @State private var isProcessing = false
     @State private var progressMessage = ""
     @State private var alertState: SettingsAlertState?
+    @State private var showClearAllCacheConfirmation = false
+    /// 启动时自动进入上次阅读的书籍
+    @AppStorage(AppPreferenceKeys.restoreLastReaderOnLaunch) private var restoreLastReaderOnLaunch = true
 
     var body: some View {
         NavigationStack {
             List {
+                Section("启动") {
+                    Toggle(isOn: $restoreLastReaderOnLaunch) {
+                        SettingsOverviewRow(
+                            icon: "book.pages",
+                            title: "启动时打开上次阅读",
+                            detail: "开启后，启动应用会自动进入上次阅读的书籍"
+                        )
+                    }
+                    .tint(themeManager.color(.accent))
+                    .themedSurfaceListRow()
+                }
+
                 Section("外观") {
                     NavigationLink(destination: ThemeManagementView().toolbar(.hidden, for: .tabBar)) {
                         SettingsOverviewRow(
@@ -71,18 +86,28 @@ struct SettingsView: View {
                         )
                     }
                     .themedSurfaceListRow()
+
+                    Button {
+                        showClearAllCacheConfirmation = true
+                    } label: {
+                        SettingsOverviewRow(
+                            icon: "trash",
+                            title: "清理全部阅读缓存",
+                            detail: "删除所有章节、目录和离线清单，保留书架与阅读进度"
+                        )
+                    }
+                    .disabled(isProcessing)
+                    .tint(themeManager.color(.destructive))
+                    .themedSurfaceListRow()
                 }
 
                 Section("关于") {
-                    HStack {
+                    NavigationLink(destination: AboutView().toolbar(.hidden, for: .tabBar)) {
                         SettingsOverviewRow(
                             icon: "info.circle",
-                            title: "版本",
-                            detail: "当前已安装版本"
+                            title: "关于",
+                            detail: "版本、开发人员、开源许可与免责声明"
                         )
-                        Spacer()
-                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—")
-                            .foregroundStyle(themeManager.color(.secondaryText))
                     }
                     .themedSurfaceListRow()
                 }
@@ -124,6 +149,14 @@ struct SettingsView: View {
             } message: {
                 Text(alertState?.message ?? "")
             }
+            .alert("清理全部阅读缓存？", isPresented: $showClearAllCacheConfirmation) {
+                Button("全部清理", role: .destructive) {
+                    Task { await clearAllReadingCaches() }
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("将删除所有书籍的章节正文、目录、离线清单和内存阅读会话，但不会删除书架、阅读进度或书源。")
+            }
             .overlay {
                 if isProcessing {
                     ZStack {
@@ -162,6 +195,22 @@ struct SettingsView: View {
                 message: error.localizedDescription
             )
         }
+    }
+
+    private func clearAllReadingCaches() async {
+        isProcessing = true
+        progressMessage = "正在清理阅读缓存…"
+        defer {
+            isProcessing = false
+            progressMessage = ""
+        }
+
+        let bookshelfViewModel = BookshelfViewModel(modelContext: modelContext)
+        await bookshelfViewModel.clearAllReadingCaches()
+        alertState = SettingsAlertState(
+            title: "清理完成",
+            message: "全部阅读缓存已清理，书架和阅读进度已保留。"
+        )
     }
 
 }
@@ -212,4 +261,14 @@ private enum SettingsSheet: Identifiable {
             return "import-local-book"
         }
     }
+}
+
+/// 应用级偏好开关的存储 key。
+///
+/// 统一用 `@AppStorage` 读写：key 从未写入过时会取 `@AppStorage` 声明的默认值。
+/// 所以默认值只在声明处给一次，读取方不要改用 `UserDefaults.bool(forKey:)`，
+/// 那条路径在 key 不存在时返回 `false`，会把默认行为改掉。
+enum AppPreferenceKeys {
+    /// 启动时自动打开上次阅读的书籍
+    static let restoreLastReaderOnLaunch = "legado.preference.restoreLastReaderOnLaunch"
 }

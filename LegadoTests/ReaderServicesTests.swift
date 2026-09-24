@@ -16,6 +16,135 @@ private actor TocRequestCounter {
 }
 
 final class ReaderServicesTests: XCTestCase {
+    func testAutomaticPrefetchWindowOnlyIncludesFollowingChapters() {
+        XCTAssertEqual(
+            ReaderContentService.automaticPrefetchIndices(after: 4, chapterCount: 10, count: 3),
+            [5, 6, 7]
+        )
+        XCTAssertEqual(
+            ReaderContentService.automaticPrefetchIndices(after: 8, chapterCount: 10, count: 3),
+            [9]
+        )
+        XCTAssertEqual(
+            ReaderContentService.automaticPrefetchIndices(after: 9, chapterCount: 10, count: 3),
+            []
+        )
+    }
+
+    func testMissingChapterIndicesExcludeAlreadyPersistedChapters() {
+        XCTAssertEqual(
+            ReaderContentService.missingChapterIndices(
+                from: 3,
+                through: 7,
+                cachedIndices: [3, 5, 7]
+            ),
+            [4, 6]
+        )
+    }
+
+    func testCachedChapterIndicesFindsPersistedOfflineChaptersWithoutReadingBodies() throws {
+        let cacheKey = "offline-index-\(UUID().uuidString)"
+        let chapter = BookChapter(index: 2, title: "真实目录名称", url: "/chapter/3", bookUrl: "book")
+        try ChapterCacheStore.saveSynchronously(bookKey: cacheKey, index: 0, content: "第一章")
+        try ChapterCacheStore.saveSynchronously(bookKey: cacheKey, index: 2, content: "第三章", chapter: chapter)
+
+        XCTAssertEqual(ChapterCacheStore.cachedChapterIndices(bookKey: cacheKey), [0, 2])
+        XCTAssertTrue(ChapterCacheStore.hasNonEmptyContent(bookKey: cacheKey, index: 2))
+        XCTAssertEqual(ChapterCacheStore.chapterMetadata(bookKey: cacheKey, index: 2)?.title, "真实目录名称")
+        ChapterCacheStore.clear(bookKey: cacheKey)
+    }
+
+    func testOfflineManifestRequiresBothTocAndEveryChapterBody() throws {
+        let cacheKey = "offline-manifest-\(UUID().uuidString)"
+        let chapters = [
+            BookChapter(index: 0, title: "目录一", url: "/1", bookUrl: "book"),
+            BookChapter(index: 1, title: "目录二", url: "/2", bookUrl: "book")
+        ]
+        try ChapterCacheStore.saveSynchronously(bookKey: cacheKey, index: 0, content: "正文一", chapter: chapters[0])
+        try ChapterCacheStore.saveOfflineBookManifest(bookKey: cacheKey, chapters: chapters)
+        XCTAssertFalse(ChapterCacheStore.isOfflineBookComplete(bookKey: cacheKey))
+
+        try ChapterCacheStore.saveSynchronously(bookKey: cacheKey, index: 1, content: "正文二", chapter: chapters[1])
+        XCTAssertTrue(ChapterCacheStore.isOfflineBookComplete(bookKey: cacheKey))
+        XCTAssertEqual(ChapterCacheStore.offlineBookManifest(bookKey: cacheKey)?.chapters.map(\.title), ["目录一", "目录二"])
+        ChapterCacheStore.clear(bookKey: cacheKey)
+    }
+
+    func testOfflineManifestCanBeWrittenWhenTargetDoesNotExist() throws {
+        let cacheKey = "offline-manifest-first-write-\(UUID().uuidString)"
+        let chapters = [
+            BookChapter(index: 0, title: "第一章", url: "/1", bookUrl: "book")
+        ]
+
+        try ChapterCacheStore.saveOfflineBookManifest(bookKey: cacheKey, chapters: chapters)
+
+        XCTAssertEqual(
+            ChapterCacheStore.offlineBookManifest(bookKey: cacheKey)?.chapters.map(\.title),
+            ["第一章"]
+        )
+        ChapterCacheStore.clear(bookKey: cacheKey)
+    }
+
+    @MainActor
+    func testCachedSuffixIsCompleteFromCurrentChapterWithoutEarlierChaptersOrManifest() throws {
+        let cacheKey = "cached-suffix-\(UUID().uuidString)"
+        let chapters = (0..<5).map { index in
+            BookChapter(index: index, title: "第\(index + 1)章", url: "/\(index)", bookUrl: "book")
+        }
+        for index in 2...4 {
+            try ChapterCacheStore.saveSynchronously(bookKey: cacheKey, index: index, content: "正文\(index)")
+        }
+
+        XCTAssertNil(ChapterCacheStore.offlineBookManifest(bookKey: cacheKey))
+        XCTAssertTrue(ReaderContentService.hasPersistedEntireBook(
+            chapterCount: 5, startingAt: 2, chapterCacheKey: cacheKey
+        ))
+        XCTAssertFalse(ReaderContentService.hasPersistedEntireBook(
+            chapterCount: 5, startingAt: 1, chapterCacheKey: cacheKey
+        ))
+        let service = ReaderContentService(
+            chapters: chapters,
+            source: BookSource(bookSourceName: "测试书源", bookSourceUrl: "https://example.com"),
+            bookName: "测试书",
+            chapterCacheKey: cacheKey,
+            initialIndex: 2,
+            modelContext: nil
+        )
+        XCTAssertTrue(service.isEntireBookCached)
+        service.refreshCacheStatus(from: 1)
+        XCTAssertFalse(service.isEntireBookCached)
+        service.refreshCacheStatus(from: 2)
+        XCTAssertTrue(service.isEntireBookCached)
+        ChapterCacheStore.clear(bookKey: cacheKey)
+    }
+
+    func testConcurrentChapterAndManifestWritesRemainReadable() async throws {
+        let cacheKey = "concurrent-writes-\(UUID().uuidString)"
+        let chapters = (0..<12).map { index in
+            BookChapter(index: index, title: "第\(index + 1)章", url: "/\(index)")
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            for chapter in chapters {
+                group.addTask {
+                    try? await ChapterCacheStore.saveOnUtilityQueue(
+                        bookKey: cacheKey,
+                        index: chapter.index,
+                        content: "正文\(chapter.index)",
+                        chapter: chapter
+                    )
+                }
+            }
+            group.addTask {
+                try? ChapterCacheStore.saveOfflineBookManifest(bookKey: cacheKey, chapters: chapters)
+            }
+        }
+
+        XCTAssertEqual(ChapterCacheStore.offlineBookManifest(bookKey: cacheKey)?.chapters.count, chapters.count)
+        XCTAssertTrue(ChapterCacheStore.isOfflineBookComplete(bookKey: cacheKey))
+        ChapterCacheStore.clear(bookKey: cacheKey)
+    }
+
     @MainActor
     func testConcurrentTocLoadsShareOneRequestAndCacheWrite() async throws {
         let container = try SwiftLegadoModelContainerFactory.makeModelContainer(isStoredInMemoryOnly: true)
@@ -280,15 +409,43 @@ final class ReaderServicesTests: XCTestCase {
 
     func testEntireBookCacheStateDisablesDownloadAfterCompletion() {
         XCTAssertEqual(
-            ReaderBookCacheState.resolve(isDownloading: false, isEntireBookCached: false),
+            ReaderBookCacheState.resolve(
+                isDownloading: false,
+                isEntireBookCached: false,
+                hasCompleteTableOfContents: false
+            ),
+            .unavailable
+        )
+        XCTAssertEqual(
+            ReaderBookCacheState.resolve(
+                isDownloading: false,
+                isEntireBookCached: false,
+                hasCompleteTableOfContents: true
+            ),
             .available
         )
         XCTAssertEqual(
-            ReaderBookCacheState.resolve(isDownloading: true, isEntireBookCached: false),
+            ReaderBookCacheState.resolve(
+                isDownloading: true,
+                isEntireBookCached: false,
+                hasCompleteTableOfContents: true
+            ),
             .downloading
         )
         XCTAssertEqual(
-            ReaderBookCacheState.resolve(isDownloading: false, isEntireBookCached: true),
+            ReaderBookCacheState.resolve(
+                isDownloading: false,
+                isEntireBookCached: true,
+                hasCompleteTableOfContents: false
+            ),
+            .unavailable
+        )
+        XCTAssertEqual(
+            ReaderBookCacheState.resolve(
+                isDownloading: false,
+                isEntireBookCached: true,
+                hasCompleteTableOfContents: true
+            ),
             .completed
         )
     }

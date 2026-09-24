@@ -24,11 +24,12 @@ class DZMReadCatalogView: UIView,UITableViewDelegate,UITableViewDataSource {
         
         didSet{
             
-            tableView.reloadData()
-            
+            // `scrollRecord()` 内部会按需刷新表，这里不再单独 reload 一次
             scrollRecord()
         }
     }
+
+    var isChapterCached: ((Int) -> Bool)?
     
     private(set) var tableView:DZMTableView!
     
@@ -52,7 +53,18 @@ class DZMReadCatalogView: UIView,UITableViewDelegate,UITableViewDataSource {
         
         if readModel != nil {
             
-            tableView.reloadData()
+            // 只在表内行数和数据源不一致时补一次整表 reload。
+            //
+            // 打开目录的路径是 `DZMReadLeftView.updateUI()`（已经刷新过）→ 这里，行数必然一致，
+            // 再整表 reload 一次只会把已经布局好的 cell 全部丢弃重建，是纯浪费。
+            // leftView 构造时走的是 `readModel` 的 didSet，那时表还是空的，行数不一致，
+            // reload 照常发生 —— 两条路径都不会漏刷。
+            let rowCount = readModel.chapterListModels.count
+            
+            if tableView.numberOfRows(inSection: 0) != rowCount {
+                
+                tableView.reloadData()
+            }
        
             if !readModel.chapterListModels.isEmpty {
                 
@@ -100,6 +112,7 @@ class DZMReadCatalogView: UIView,UITableViewDelegate,UITableViewDataSource {
         
         // 章节名
         cell.chapterName.text = readModel.chapterListModels[indexPath.row].name
+        cell.cachedMark.isHidden = !(isChapterCached?(indexPath.row) ?? false)
         
         // 日夜间
         if DZMUserDefaults.bool(DZM_READ_KEY_MODE_DAY_NIGHT) {

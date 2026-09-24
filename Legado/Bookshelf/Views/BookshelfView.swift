@@ -21,6 +21,7 @@ struct BookshelfView: View {
     @State private var showDeleteConfirmation = false
     @State private var navigationTarget: BookshelfNavigationTarget?
     @State private var readerRoute: BookshelfReaderRoute?
+    @State private var preparingReaderBookURL: String?
     @State private var readerLaunchError: ReaderLaunchError?
     @State private var exportItem: ExportShareItem?
     @State private var exportErrorMessage: String?
@@ -125,9 +126,7 @@ struct BookshelfView: View {
                 isPresented: Binding(
                     get: { exportErrorMessage != nil },
                     set: { newValue in
-                        if !newValue {
-                            exportErrorMessage = nil
-                        }
+                        if !newValue { exportErrorMessage = nil }
                     }
                 )
             ) {
@@ -275,9 +274,16 @@ struct BookshelfView: View {
                 ForEach(viewModel.displayBooks, id: \.bookUrl) { book in
                     BookCoverCell(
                         book: book,
-                        source: allSources.first(where: { $0.bookSourceUrl == book.sourceUrl }),
+                        source: LocalBookSupport.resolveSource(for: book.sourceUrl, in: allSources),
                         isEditing: viewModel.isEditing,
-                        isSelected: viewModel.selectedBookURLs.contains(book.bookUrl)
+                        isSelected: viewModel.selectedBookURLs.contains(book.bookUrl),
+                        onDetail: {
+                            guard !viewModel.isEditing else { return }
+                            navigationTarget = BookshelfNavigationTarget(
+                                bookUrl: book.bookUrl,
+                                destination: .detail
+                            )
+                        }
                     )
                     .contentShape(Rectangle())
                     .onTapGesture {
@@ -287,29 +293,34 @@ struct BookshelfView: View {
                             openReader(for: book)
                         }
                     }
-                    .onLongPressGesture(minimumDuration: 0.55) {
-                        guard !viewModel.isEditing else { return }
-                        navigationTarget = BookshelfNavigationTarget(bookUrl: book.bookUrl, destination: .detail)
-                    }
                     .contextMenu {
-                        if !viewModel.groups.isEmpty && !viewModel.isEditing {
-                            Menu("移入分组") {
-                                ForEach(viewModel.groups, id: \.groupId) { group in
-                                    Button {
-                                        viewModel.toggleGroup(group.groupId, for: book)
-                                    } label: {
-                                        Label(
-                                            group.groupName,
-                                            systemImage: book.hasGroup(group.groupId)
-                                                ? "checkmark.circle.fill"
-                                                : "circle"
-                                        )
+                        if !viewModel.isEditing {
+                            Button {
+                                navigationTarget = BookshelfNavigationTarget(
+                                    bookUrl: book.bookUrl,
+                                    destination: .detail
+                                )
+                            } label: {
+                                Label("书籍详情", systemImage: "info.circle")
+                            }
+
+                            if !viewModel.groups.isEmpty {
+                                Menu("移入分组") {
+                                    ForEach(viewModel.groups, id: \.groupId) { group in
+                                        Button {
+                                            viewModel.toggleGroup(group.groupId, for: book)
+                                        } label: {
+                                            Label(
+                                                group.groupName,
+                                                systemImage: book.hasGroup(group.groupId)
+                                                    ? "checkmark.circle.fill"
+                                                    : "circle"
+                                            )
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        if !viewModel.isEditing {
                             Menu("导出") {
                                 Button("导出 TXT") {
                                     Task { await export(book, format: .txt) }
@@ -349,21 +360,52 @@ struct BookshelfView: View {
     }
 
     private func openReader(for book: BookEntity) {
-        guard let source = allSources.first(where: { $0.bookSourceUrl == book.sourceUrl }) else {
+        guard preparingReaderBookURL == nil else { return }
+        // 本地书没有对应的书源记录，走 `resolveSource` 拿内置的本地书源
+        guard let source = LocalBookSupport.resolveSource(for: book.sourceUrl, in: allSources) else {
             readerLaunchError = ReaderLaunchError(
                 bookURL: book.bookUrl,
                 message: "该书籍对应的书源已被删除或禁用"
             )
             return
         }
-        readerRoute = BookshelfReaderRoute(
-            book: book,
-            source: source,
-            cachedSession: ReaderSessionCache.shared.session(
-                bookID: book.bookUrl,
-                sourceURL: source.bookSourceUrl
+        if let session = ReaderSessionCache.shared.session(bookID: book.bookUrl, sourceURL: source.bookSourceUrl) {
+            readerRoute = BookshelfReaderRoute(book: book, source: source, cachedSession: session)
+            return
+        }
+
+        let cacheKey = ChapterCacheStore.makeKey(sourceUrl: source.bookSourceUrl, bookUrl: book.bookUrl)
+        guard ChapterCacheStore.hasNonEmptyContent(bookKey: cacheKey, index: book.currentChapterIndex) else {
+            readerRoute = BookshelfReaderRoute(book: book, source: source, cachedSession: nil)
+            return
+        }
+
+        preparingReaderBookURL = book.bookUrl
+        Task { @MainActor in
+            defer { preparingReaderBookURL = nil }
+            let toc = BookTocViewModel(
+                detail: book.toBookDetail(),
+                source: source,
+                bookshelfViewModel: viewModel
             )
-        )
+            toc.allSources = allSources
+            if await toc.restoreCachedChaptersIfAvailable(),
+               let result = toc.makeReaderViewModel(startIndex: book.currentChapterIndex) {
+                await result.vm.loadCurrentChapter()
+                if let content = result.vm.currentContent,
+                   !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let session = ReaderSession(viewModel: result.vm, bookID: result.bookID)
+                    ReaderSessionCache.shared.store(session)
+                    readerRoute = BookshelfReaderRoute(book: book, source: source, cachedSession: session)
+                    Task { @MainActor in
+                        await toc.waitForBackgroundTocRefresh()
+                        result.vm.updateChapters(toc.chapters, hasCompleteTableOfContents: toc.hasCompleteTableOfContents)
+                    }
+                    return
+                }
+            }
+            readerRoute = BookshelfReaderRoute(book: book, source: source, cachedSession: nil)
+        }
     }
 
     private var batchToolbar: some View {
@@ -436,6 +478,7 @@ private struct BookCoverCell: View {
     let source: BookSource?
     var isEditing: Bool = false
     var isSelected: Bool = false
+    var onDetail: (() -> Void)?
 
     private var shouldShowCurrentChapter: Bool {
         guard let currentChapterName = book.currentChapterName,
@@ -485,6 +528,22 @@ private struct BookCoverCell: View {
                         }
                     }
                     .padding(6)
+                }
+                .overlay(alignment: .topLeading) {
+                    if !isEditing {
+                        Button {
+                            onDetail?()
+                        } label: {
+                            Image(systemName: "info.circle")
+                                .font(.title3)
+                                .foregroundStyle(themeManager.color(.selectionText))
+                                .shadow(radius: 2)
+                                .padding(6)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("书籍详情")
+                    }
                 }
                 .overlay {
                     if isEditing {
@@ -607,7 +666,7 @@ struct BookshelfReaderRouteView: View {
 
     @MainActor
     private func prepareReader() async {
-        let restoredFromCache = tocViewModel.restoreCachedChaptersIfAvailable()
+        let restoredFromCache = await tocViewModel.restoreCachedChaptersIfAvailable()
         if !restoredFromCache {
             await tocViewModel.loadToc()
         } else {
@@ -632,7 +691,10 @@ struct BookshelfReaderRouteView: View {
 
         Task { @MainActor in
             await tocViewModel.waitForBackgroundTocRefresh()
-            result.vm.updateChapters(tocViewModel.chapters)
+            result.vm.updateChapters(
+                tocViewModel.chapters,
+                hasCompleteTableOfContents: tocViewModel.hasCompleteTableOfContents
+            )
         }
     }
 }
